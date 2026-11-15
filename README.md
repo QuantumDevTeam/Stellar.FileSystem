@@ -1,11 +1,11 @@
 # Stellar.FileSystem
 
-The FileSystem module of StellarEngine
+File system of the engine
 
 | | |
 |---|---|
-| Level | `HighLevel` |
-| Descriptor | [`Stellar.FileSystem.stellar.module`](Stellar.FileSystem.stellar.module) |
+| Level | `CoreModule` |
+| Descriptor | `Stellar.FileSystem.stellar.module` |
 
 ## Layout
 
@@ -14,7 +14,9 @@ Stellar.FileSystem/
 ├── Stellar.FileSystem.stellar.module   what the engine knows about the module
 ├── src/Managed/Stellar.FileSystem/     the C# project
 ├── src/Native/                   native projects, if any: built first, their DLLs travel with the assembly
-└── tests/                        test projects
+├── tests/                        test projects
+├── Branding/Logo.svg             the icon of the module: a placeholder, replace it with your own
+└── Docs/                         the documentation site of the module (docfx.json, published by .github/workflows/docs.yml)
 ```
 
 ## Working on it

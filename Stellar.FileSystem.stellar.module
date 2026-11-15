@@ -1,8 +1,8 @@
 {
-  "$schema": "file:///F:/project/CS/StellarEngine/Shared/Schemas/stellar.module.schema.json",
+  "$schema": "https://quantumdevteam.github.io/StellarEngine-Core/schemas/stellar.module.schema.json",
   "Id": "Stellar.FileSystem",
   "Version": "0.8.0",
-  "Level": "HighLevel",
-  "Description": "The FileSystem module of StellarEngine",
+  "Level": "CoreModule",
+  "Description": "File system of the engine",
   "Dependencies": []
 }
