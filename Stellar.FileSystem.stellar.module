@@ -1,0 +1,8 @@
+{
+  "$schema": "file:///F:/project/CS/StellarEngine/Shared/Schemas/stellar.module.schema.json",
+  "Id": "Stellar.FileSystem",
+  "Version": "0.8.0",
+  "Level": "HighLevel",
+  "Description": "The FileSystem module of StellarEngine",
+  "Dependencies": []
+}
