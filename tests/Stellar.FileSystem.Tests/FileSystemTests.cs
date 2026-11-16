@@ -17,17 +17,45 @@ public class FileSystemTests
     {
         using var fileSystem = WithMemory("assets");
 
-        fileSystem.GetDomain("Assets").Name.Should().Be("assets");
-        fileSystem.Invoking(fs => fs.GetDomain("nowhere")).Should().Throw<DomainNotFoundException>();
+        fileSystem.Domains.Get("Assets").Name.Should().Be("assets");
+        fileSystem.Domains.Contains("ASSETS").Should().BeTrue();
+        fileSystem.Domains.Contains("not a name").Should().BeFalse();
+        fileSystem.Invoking(fs => fs.Domains.Get("nowhere")).Should().Throw<DomainNotFoundException>();
         fileSystem.Invoking(fs => fs.Mount(new DomainMount("assets", DomainScheme.Memory, ""))).Should().Throw<InvalidOperationException>();
         fileSystem.Invoking(fs => fs.Mount(new DomainMount("net", new DomainScheme("net"), ""))).Should().Throw<InvalidOperationException>();
+    }
+
+    [Fact]
+    public void Drivers_AreACatalogBySchemes()
+    {
+        using var fileSystem = VirtualFileSystem.CreateDefault();
+
+        fileSystem.Drivers.Keys.Should().BeEquivalentTo([DomainScheme.Directory, DomainScheme.Assembly, DomainScheme.Memory, DomainScheme.Overlay]);
+        fileSystem.Invoking(fs => fs.AddDriver(new Drivers.MemoryDriver())).Should().Throw<InvalidOperationException>();
+        fileSystem.Invoking(fs => fs.Drivers.Set(new DomainScheme("zip"), new Drivers.MemoryDriver())).Should().Throw<ArgumentException>();
+
+        fileSystem.Drivers.Remove(DomainScheme.Memory).Should().BeTrue();
+        fileSystem.Invoking(fs => fs.Mount(new DomainMount("m", DomainScheme.Memory, ""))).Should().Throw<InvalidOperationException>();
+    }
+
+    [Fact]
+    public void ContentTypes_AreACatalogByExtension()
+    {
+        var types = ContentTypeCatalog.CreateDefault();
+
+        types.Get(".PNG").MediaType.Should().Be("image/png");
+        types.Resolve(FilePath.Parse("a://b/c.Json")).IsText.Should().BeTrue();
+        types.Resolve(FilePath.Parse("a://b/c.unknown")).Should().Be(ContentType.OctetStream);
+        types.Contains("png").Should().BeFalse();
+        types.Invoking(t => t.Set("png", ContentType.PlainText)).Should().Throw<ArgumentException>();
+        types.Invoking(t => t.Set(".x", default)).Should().Throw<ArgumentException>();
     }
 
     [Fact]
     public void Unmount_TellsAndDisposes()
     {
         using var fileSystem = WithMemory("assets");
-        var domain = fileSystem.GetDomain("assets");
+        var domain = fileSystem.Domains.Get("assets");
         IDomain? told = null;
         fileSystem.Unmounting += d => told = d;
 

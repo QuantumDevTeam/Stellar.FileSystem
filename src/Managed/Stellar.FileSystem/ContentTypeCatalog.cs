@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+using Stellar.Core.Data.Catalog;
 using Stellar.Kernel.FileSystem;
 
 namespace Stellar.FileSystem;
@@ -6,18 +6,16 @@ namespace Stellar.FileSystem;
 /// <summary>
 /// The content types of a file system, by extension; the extensions compare in any case.
 /// </summary>
-public sealed class ContentTypeRegistry
-    : IContentTypeRegistry
+public sealed class ContentTypeCatalog()
+    : Catalog<string, ContentType>(StringComparer.OrdinalIgnoreCase), IContentTypeCatalog
 {
-    private readonly ConcurrentDictionary<string, ContentType> _types = new(StringComparer.OrdinalIgnoreCase);
-
     /// <summary>
-    /// Makes a registry with the formats every engine reads: text, data, images, sounds, models, fonts, shaders.
+    /// Makes a catalog with the formats every engine reads: text, data, images, sounds, models, fonts, shaders.
     /// </summary>
-    /// <returns>The registry.</returns>
-    public static ContentTypeRegistry CreateDefault()
+    /// <returns>The catalog.</returns>
+    public static ContentTypeCatalog CreateDefault()
     {
-        var registry = new ContentTypeRegistry();
+        var catalog = new ContentTypeCatalog();
 
         foreach (var (extension, mediaType) in new[]
                  {
@@ -29,7 +27,7 @@ public sealed class ContentTypeRegistry
                      (".shader", "text/x-shader"), (".lua", "text/x-lua"), (".cs", "text/x-csharp"),
                      (".js", "text/javascript"), (".html", "text/html"), (".css", "text/css"), (".svg", "image/svg+xml")
                  })
-            registry.Register(extension, new ContentType(mediaType, ContentKind.Text, "utf-8"));
+            catalog.Set(extension, new ContentType(mediaType, ContentKind.Text, "utf-8"));
 
         foreach (var (extension, mediaType) in new[]
                  {
@@ -41,33 +39,30 @@ public sealed class ContentTypeRegistry
                      (".spv", "application/x-spirv"), (".bin", "application/octet-stream"), (".zip", "application/zip"),
                      (".dll", "application/x-msdownload")
                  })
-            registry.Register(extension, new ContentType(mediaType, ContentKind.Binary));
+            catalog.Set(extension, new ContentType(mediaType, ContentKind.Binary));
 
-        return registry;
-    }
-
-    /// <inheritdoc/>
-    public void Register(string extension, ContentType contentType)
-    {
-        ArgumentNullException.ThrowIfNull(extension);
-        if (extension.Length < 2 || extension[0] != '.' || extension.IndexOfAny(['/', '\\', ' ']) >= 0)
-            throw new ArgumentException($"'{extension}' is not an extension: expected a dot and a name, such as .png", nameof(extension));
-        if (contentType.IsUnknown) throw new ArgumentException("The unknown content type cannot be registered", nameof(contentType));
-
-        _types[extension] = contentType;
-    }
-
-    /// <inheritdoc/>
-    public bool TryGet(string extension, out ContentType contentType)
-    {
-        ArgumentNullException.ThrowIfNull(extension);
-        return _types.TryGetValue(extension, out contentType);
+        return catalog;
     }
 
     /// <inheritdoc/>
     public ContentType Resolve(FilePath path)
     {
         var extension = path.Extension;
-        return extension.Length > 0 && _types.TryGetValue(extension, out var contentType) ? contentType : ContentType.OctetStream;
+        return extension.Length > 0 && TryGet(extension, out var contentType) ? contentType : ContentType.OctetStream;
+    }
+
+    /// <inheritdoc/>
+    protected override string NormalizeKey(string key)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        if (key.Length < 2 || key[0] != '.' || key.IndexOfAny(['/', '\\', ' ']) >= 0)
+            throw new ArgumentException($"'{key}' is not an extension: expected a dot and a name, such as .png", nameof(key));
+        return key;
+    }
+
+    /// <inheritdoc/>
+    protected override void Validate(string key, ContentType value)
+    {
+        if (value.IsUnknown) throw new ArgumentException($"The unknown content type cannot be set for '{key}'", nameof(value));
     }
 }

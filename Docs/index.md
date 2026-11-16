@@ -34,7 +34,7 @@ The code names domains, never places of the machine: those are given once, when 
 | `overlay` | Domains, first wins: `mods,dlc,base` | Reads the first layer that has a file; `write=<layer>` sends writes there, copying a file of a lower layer up first |
 
 A driver of another scheme (an archive, a network, a world of a game) implements `IFileDriver` and is registered
-with `RegisterDriver`; the contracts are in `Stellar.Kernel.FileSystem`.
+with `AddDriver` (the catalog `Drivers`); the contracts are in `Stellar.Kernel.FileSystem`.
 
 ## Working on it
 

@@ -142,7 +142,7 @@ internal sealed class OverlayDomain
     private IEnumerable<IDomain> Layers()
     {
         foreach (var name in _layers)
-            if (FileSystem.TryGetDomain(name, out var layer))
+            if (FileSystem.Domains.TryGet(name, out var layer))
                 yield return layer;
     }
 
@@ -150,7 +150,7 @@ internal sealed class OverlayDomain
         Layers().FirstOrDefault(layer => layer.Exists(path)) ?? throw NotFound(path);
 
     private IDomain WriteLayer() =>
-        _writeLayer is not null && FileSystem.TryGetDomain(_writeLayer, out var layer)
+        _writeLayer is not null && FileSystem.Domains.TryGet(_writeLayer, out var layer)
             ? layer
             : throw new InvalidOperationException($"The write layer '{_writeLayer}' of the overlay '{Name}' is not mounted");
 

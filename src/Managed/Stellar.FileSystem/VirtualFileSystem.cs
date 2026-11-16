@@ -1,7 +1,7 @@
-using System.Collections.Concurrent;
-using System.Diagnostics.CodeAnalysis;
+using Stellar.Core.Data.Catalog;
 using Stellar.Core.Quantization;
 using Stellar.FileSystem.Drivers;
+using Stellar.Kernel.Data.Catalog;
 using Stellar.Kernel.FileSystem;
 
 namespace Stellar.FileSystem;
@@ -17,19 +17,19 @@ namespace Stellar.FileSystem;
 public sealed class VirtualFileSystem
     : Quant<MetaQuant>, IFileSystem
 {
-    private readonly ConcurrentDictionary<DomainScheme, IFileDriver> _drivers = new();
-    private readonly ConcurrentDictionary<string, IDomain> _domains = new(StringComparer.Ordinal);
+    private readonly DriverCatalog _drivers = new();
+    private readonly DomainCatalog _domains = new();
     private readonly Lock _mounting = new();
     private volatile bool _disposed;
 
     /// <summary>
     /// Makes a file system with no drivers and no domains.
     /// </summary>
-    /// <param name="contentTypes">The content types; an empty registry if <c>null</c>.</param>
-    public VirtualFileSystem(IContentTypeRegistry? contentTypes = null)
+    /// <param name="contentTypes">The content types; an empty catalog if <c>null</c>.</param>
+    public VirtualFileSystem(IContentTypeCatalog? contentTypes = null)
         : base(new MetaQuant())
     {
-        ContentTypes = contentTypes ?? new ContentTypeRegistry();
+        ContentTypes = contentTypes ?? new ContentTypeCatalog();
     }
 
     /// <summary>
@@ -38,19 +38,22 @@ public sealed class VirtualFileSystem
     /// <returns>The file system, with no domain mounted.</returns>
     public static VirtualFileSystem CreateDefault()
     {
-        var fileSystem = new VirtualFileSystem(ContentTypeRegistry.CreateDefault());
-        fileSystem.RegisterDriver(new DirectoryDriver());
-        fileSystem.RegisterDriver(new AssemblyDriver());
-        fileSystem.RegisterDriver(new MemoryDriver());
-        fileSystem.RegisterDriver(new OverlayDriver());
+        var fileSystem = new VirtualFileSystem(ContentTypeCatalog.CreateDefault());
+        fileSystem.AddDriver(new DirectoryDriver());
+        fileSystem.AddDriver(new AssemblyDriver());
+        fileSystem.AddDriver(new MemoryDriver());
+        fileSystem.AddDriver(new OverlayDriver());
         return fileSystem;
     }
 
     /// <inheritdoc/>
-    public IContentTypeRegistry ContentTypes { get; }
+    public ICatalog<DomainScheme, IFileDriver> Drivers => _drivers;
 
     /// <inheritdoc/>
-    public IReadOnlyCollection<IDomain> Domains => _domains.Values.ToArray();
+    public IReadOnlyCatalog<string, IDomain> Domains => _domains;
+
+    /// <inheritdoc/>
+    public IContentTypeCatalog ContentTypes { get; }
 
     /// <inheritdoc/>
     public event Action<IDomain>? Mounted;
@@ -59,32 +62,17 @@ public sealed class VirtualFileSystem
     public event Action<IDomain>? Unmounting;
 
     /// <inheritdoc/>
-    public void RegisterDriver(IFileDriver driver)
-    {
-        ArgumentNullException.ThrowIfNull(driver);
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if (string.IsNullOrEmpty(driver.Scheme.Name)) throw new ArgumentException("The driver has no scheme", nameof(driver));
-
-        if (!_drivers.TryAdd(driver.Scheme, driver))
-            throw new InvalidOperationException($"A driver of the scheme '{driver.Scheme}' is registered already");
-    }
-
-    /// <inheritdoc/>
-    public bool TryGetDriver(DomainScheme scheme, [NotNullWhen(true)] out IFileDriver? driver) =>
-        _drivers.TryGetValue(scheme, out driver);
-
-    /// <inheritdoc/>
     public IDomain Mount(DomainMount mount)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         var name = FileSystemNames.NormalizeName(mount.Name, nameof(mount));
-        if (!_drivers.TryGetValue(mount.Scheme, out var driver))
-            throw new InvalidOperationException($"No driver of the scheme '{mount.Scheme}' is registered, for the domain '{name}'");
+        if (!_drivers.TryGet(mount.Scheme, out var driver))
+            throw new InvalidOperationException($"No driver of the scheme '{mount.Scheme}' is there, for the domain '{name}'");
 
         IDomain domain;
         lock (_mounting)
         {
-            if (_domains.ContainsKey(name)) throw new InvalidOperationException($"A domain '{name}' is mounted already");
+            if (_domains.Contains(name)) throw new InvalidOperationException($"A domain '{name}' is mounted already");
 
             domain = driver.Mount(mount with { Name = name }, this);
             if (domain.Name != name)
@@ -93,7 +81,7 @@ public sealed class VirtualFileSystem
                 throw new InvalidOperationException($"The driver of '{mount.Scheme}' mounted '{domain.Name}' instead of '{name}'");
             }
 
-            _domains[name] = domain;
+            _domains.Set(name, domain);
         }
 
         Mounted?.Invoke(domain);
@@ -104,12 +92,11 @@ public sealed class VirtualFileSystem
     public bool Unmount(string name)
     {
         ArgumentNullException.ThrowIfNull(name);
-        if (!FileSystemNames.TryNormalizeName(name, out var normalized)) return false;
 
         IDomain? domain;
         lock (_mounting)
         {
-            if (!_domains.TryRemove(normalized, out domain)) return false;
+            if (!_domains.TryRemove(name, out domain)) return false;
         }
 
         // Out of the file system, still working: whoever holds data of it lets go
@@ -117,18 +104,6 @@ public sealed class VirtualFileSystem
         finally { domain.Dispose(); }
         return true;
     }
-
-    /// <inheritdoc/>
-    public bool TryGetDomain(string name, [NotNullWhen(true)] out IDomain? domain)
-    {
-        ArgumentNullException.ThrowIfNull(name);
-        if (_domains.TryGetValue(name, out domain)) return true;
-        return FileSystemNames.TryNormalizeName(name, out var normalized) && _domains.TryGetValue(normalized, out domain);
-    }
-
-    /// <inheritdoc/>
-    public IDomain GetDomain(string name) =>
-        TryGetDomain(name, out var domain) ? domain : throw new DomainNotFoundException(name);
 
     /// <summary>
     /// Unmounts every domain.
@@ -138,6 +113,38 @@ public sealed class VirtualFileSystem
         if (_disposed) return;
         _disposed = true;
 
-        foreach (var name in _domains.Keys.ToArray()) Unmount(name);
+        foreach (var name in _domains.Keys) Unmount(name);
+    }
+
+    // A driver is set under its own scheme
+    private sealed class DriverCatalog
+        : Catalog<DomainScheme, IFileDriver>
+    {
+        protected override DomainScheme NormalizeKey(DomainScheme key)
+        {
+            return string.IsNullOrEmpty(key.Name) ? throw new ArgumentException("A driver needs a scheme", nameof(key)) : key;
+        }
+
+        protected override void Validate(DomainScheme key, IFileDriver value)
+        {
+            base.Validate(key, value);
+            if (value.Scheme != key)
+                throw new ArgumentException($"The driver of '{value.Scheme}' cannot be set under '{key}'", nameof(value));
+        }
+    }
+
+    // Names in any case; a missing domain says so
+    private sealed class DomainCatalog
+        : Catalog<string, IDomain>
+    {
+        protected override string NormalizeKey(string key)
+        {
+            return FileSystemNames.NormalizeName(key, nameof(key));
+        }
+
+        protected override Exception NotFound(string key)
+        {
+            return new DomainNotFoundException(key);
+        }
     }
 }
