@@ -17,25 +17,6 @@ public abstract class DomainBase
     private static readonly IReadOnlyDictionary<string, string> NoOptions = new Dictionary<string, string>();
     private volatile bool _disposed;
 
-    /// <summary>
-    /// Makes the domain.
-    /// </summary>
-    /// <param name="mount">What was mounted.</param>
-    /// <param name="fileSystem">The file system it is mounted in.</param>
-    /// <param name="capabilities">What the domain can do.</param>
-    protected DomainBase(DomainMount mount, IFileSystem fileSystem, DomainCapabilities capabilities)
-        : base(new MetaQuant())
-    {
-        ArgumentNullException.ThrowIfNull(fileSystem);
-
-        Name = FileSystemNames.NormalizeName(mount.Name, nameof(mount));
-        Scheme = mount.Scheme;
-        Source = mount.Source ?? string.Empty;
-        Options = mount.Options ?? NoOptions;
-        FileSystem = fileSystem;
-        Capabilities = capabilities;
-    }
-
     /// <inheritdoc/>
     public string Name { get; }
 
@@ -64,134 +45,64 @@ public abstract class DomainBase
     protected bool IsDisposed => _disposed;
 
     /// <summary>
-    /// Reads a yes-or-no setting of the mount.
+    /// Makes the domain.
     /// </summary>
-    /// <param name="options">The settings.</param>
-    /// <param name="key">The name of the setting.</param>
-    /// <param name="fallback">The value when the setting is absent.</param>
-    /// <returns>The value.</returns>
-    protected static bool GetFlag(IReadOnlyDictionary<string, string>? options, string key, bool fallback)
+    /// <param name="mount">What was mounted.</param>
+    /// <param name="fileSystem">The file system it is mounted in.</param>
+    /// <param name="capabilities">What the domain can do.</param>
+    protected DomainBase(DomainMount mount, IFileSystem fileSystem, DomainCapabilities capabilities)
+        : base(new MetaQuant())
     {
-        if (options is null || !options.TryGetValue(key, out var text)) return fallback;
-        return bool.TryParse(text, out var value) ? value : throw new ArgumentException($"The setting '{key}' is '{text}': expected true or false");
+        ArgumentNullException.ThrowIfNull(fileSystem);
+
+        Name = FileSystemNames.NormalizeName(mount.Name, nameof(mount));
+        Scheme = mount.Scheme;
+        Source = mount.Source ?? string.Empty;
+        Options = mount.Options ?? NoOptions;
+        FileSystem = fileSystem;
+        Capabilities = capabilities;
     }
 
     /// <summary>
-    /// Gets the full path of a path of this domain.
+    /// Makes the exception for what the domain cannot do.
     /// </summary>
-    /// <param name="path">The path inside the domain.</param>
-    /// <returns>The full path.</returns>
-    protected FilePath PathOf(string path) => FilePath.Create(Name, path);
+    protected NotSupportedException Unsupported(string what) =>
+        new($"The domain '{Name}' ({Scheme}) cannot {what}");
 
     /// <summary>
-    /// Makes the entry of a file, its content type from the file system.
+    /// Makes the exception for a file that is not there.
     /// </summary>
-    protected FileEntry FileEntryOf(string path, long length, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc, long revision)
-    {
-        var full = PathOf(path);
-        return new FileEntry(full, FileEntryKind.File, length, creationTimeUtc, lastWriteTimeUtc, FileSystem.ContentTypes.Resolve(full), revision);
-    }
+    protected FileNotFoundException NotFound(string path) =>
+        new($"No file '{PathOf(path)}'", PathOf(path).ToString());
 
     /// <summary>
-    /// Makes the entry of a directory.
+    /// Makes the exception for a directory that is not there.
     /// </summary>
-    protected FileEntry DirectoryEntryOf(string path, DateTime? creationTimeUtc = null, DateTime? lastWriteTimeUtc = null) =>
-        new(PathOf(path), FileEntryKind.Directory, 0, creationTimeUtc, lastWriteTimeUtc, default, 0);
+    protected DirectoryNotFoundException DirectoryNotFound(string path) =>
+        new($"No directory '{PathOf(path)}'");
 
-    /// <inheritdoc/>
-    public bool Exists(string path)
+    /// <summary>
+    /// Throws if the domain is disposed.
+    /// </summary>
+    protected void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
+
+    private void Require(DomainCapabilities capability, string what)
     {
-        ThrowIfDisposed();
-        return ExistsCore(Normalize(path));
+        if ((Capabilities & capability) != capability) throw Unsupported(what);
     }
 
-    /// <inheritdoc/>
-    public bool TryGetEntry(string path, out FileEntry entry)
+    private void RequireFor(FileOpenOptions options)
     {
-        ThrowIfDisposed();
-        return TryGetEntryCore(Normalize(path), out entry);
-    }
+        if (options.Writes) Require(DomainCapabilities.Write, "write");
+        else Require(DomainCapabilities.Read, "read");
 
-    /// <inheritdoc/>
-    public IEnumerable<FileEntry> Enumerate(string directory, string pattern = "*", bool recursive = false)
-    {
-        ThrowIfDisposed();
-        Require(DomainCapabilities.Enumerate, "list files");
-        ArgumentNullException.ThrowIfNull(pattern);
-        return EnumerateCore(Normalize(directory, nameof(directory)), pattern, recursive);
-    }
+        if ((options.Flags & FileOpenFlags.Atomic) == 0) return;
 
-    /// <inheritdoc/>
-    public Stream Open(string path, FileOpenOptions options)
-    {
-        ThrowIfDisposed();
-        RequireFor(options);
-        return OpenCore(Normalize(path), options);
-    }
-
-    /// <inheritdoc/>
-    public ValueTask<Stream> OpenAsync(string path, FileOpenOptions options, CancellationToken cancellationToken = default)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        ThrowIfDisposed();
-        RequireFor(options);
-        return OpenAsyncCore(Normalize(path), options, cancellationToken);
-    }
-
-    /// <inheritdoc/>
-    public IRandomAccessFile OpenRandomAccess(string path)
-    {
-        ThrowIfDisposed();
-        Require(DomainCapabilities.RandomAccess, "read at offsets");
-        return OpenRandomAccessCore(Normalize(path));
-    }
-
-    /// <inheritdoc/>
-    public bool TryGetMemory(string path, out ReadOnlyMemory<byte> data)
-    {
-        ThrowIfDisposed();
-        data = default;
-        return (Capabilities & DomainCapabilities.Memory) != 0 && TryGetMemoryCore(Normalize(path), out data);
-    }
-
-    /// <inheritdoc/>
-    public void CreateDirectory(string path)
-    {
-        ThrowIfDisposed();
-        Require(DomainCapabilities.Write, "create directories");
-        CreateDirectoryCore(Normalize(path));
-    }
-
-    /// <inheritdoc/>
-    public bool Delete(string path, bool recursive = false)
-    {
-        ThrowIfDisposed();
-        Require(DomainCapabilities.Write, "delete");
-        var normalized = Normalize(path);
-        if (normalized.Length == 0) throw new IOException($"The root of the domain '{Name}' cannot be deleted");
-        return DeleteCore(normalized, recursive);
-    }
-
-    /// <inheritdoc/>
-    public void Move(string source, string destination, bool overwrite = false)
-    {
-        ThrowIfDisposed();
-        Require(DomainCapabilities.Write, "move");
-        var from = Normalize(source, nameof(source));
-        var to = Normalize(destination, nameof(destination));
-        if (from.Length == 0 || to.Length == 0) throw new IOException($"The root of the domain '{Name}' cannot be moved");
-        if (from == to) return;
-        if (to.StartsWith(from + "/", StringComparison.Ordinal)) throw new IOException($"'{PathOf(from)}' cannot move into itself");
-        MoveCore(from, to, overwrite);
-    }
-
-    /// <inheritdoc/>
-    public IDisposable Watch(string directory, bool recursive, Action<FileChange> handler)
-    {
-        ThrowIfDisposed();
-        Require(DomainCapabilities.Watch, "watch");
-        ArgumentNullException.ThrowIfNull(handler);
-        return WatchCore(Normalize(directory, nameof(directory)), recursive, handler);
+        Require(DomainCapabilities.AtomicWrite, "replace files atomically");
+        if (options.Mode is not (FileMode.Create or FileMode.CreateNew) || options.Access != FileAccess.Write)
+            throw new ArgumentException(
+                "An atomic write creates the file anew: FileMode.Create or CreateNew, FileAccess.Write",
+                nameof(options));
     }
 
     /// <summary>Whether a file or a directory exists.</summary>
@@ -208,7 +119,8 @@ public abstract class DomainBase
     protected abstract Stream OpenCore(string path, FileOpenOptions options);
 
     /// <summary>Opens a file without blocking; by default, <see cref="OpenCore"/>.</summary>
-    protected virtual ValueTask<Stream> OpenAsyncCore(string path, FileOpenOptions options, CancellationToken cancellationToken) =>
+    protected virtual ValueTask<Stream> OpenAsyncCore(string path, FileOpenOptions options,
+        CancellationToken cancellationToken) =>
         new(OpenCore(path, options));
 
     /// <summary>Opens a file for reads at offsets.</summary>
@@ -231,7 +143,8 @@ public abstract class DomainBase
     protected virtual void MoveCore(string source, string destination, bool overwrite) => throw Unsupported("move");
 
     /// <summary>Watches a directory.</summary>
-    protected virtual IDisposable WatchCore(string directory, bool recursive, Action<FileChange> handler) => throw Unsupported("watch");
+    protected virtual IDisposable WatchCore(string directory, bool recursive, Action<FileChange> handler) =>
+        throw Unsupported("watch");
 
     /// <summary>
     /// Releases what the domain holds: called once.
@@ -241,25 +154,153 @@ public abstract class DomainBase
     }
 
     /// <summary>
-    /// Throws if the domain is disposed.
+    /// Reads a yes-or-no setting of the mount.
     /// </summary>
-    protected void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
+    /// <param name="options">The settings.</param>
+    /// <param name="key">The name of the setting.</param>
+    /// <param name="fallback">The value when the setting is absent.</param>
+    /// <returns>The value.</returns>
+    protected static bool GetFlag(IReadOnlyDictionary<string, string>? options, string key, bool fallback)
+    {
+        if (options is null
+            || !options.TryGetValue(key, out var text))
+            return fallback;
+        return bool.TryParse(text, out var value)
+            ? value
+            : throw new ArgumentException($"The setting '{key}' is '{text}': expected true or false");
+    }
 
     /// <summary>
-    /// Makes the exception for what the domain cannot do.
+    /// Gets the full path of a path of this domain.
     /// </summary>
-    protected NotSupportedException Unsupported(string what) =>
-        new($"The domain '{Name}' ({Scheme}) cannot {what}");
+    /// <param name="path">The path inside the domain.</param>
+    /// <returns>The full path.</returns>
+    protected FilePath PathOf(string path) => FilePath.Create(Name, path);
 
     /// <summary>
-    /// Makes the exception for a file that is not there.
+    /// Makes the entry of a file, its content type from the file system.
     /// </summary>
-    protected FileNotFoundException NotFound(string path) => new($"No file '{PathOf(path)}'", PathOf(path).ToString());
+    protected FileEntry FileEntryOf(string path, long length,
+        DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc,
+        long revision)
+    {
+        var full = PathOf(path);
+        return new FileEntry(full, FileEntryKind.File, length,
+            creationTimeUtc, lastWriteTimeUtc,
+            FileSystem.ContentTypes.Resolve(full), revision);
+    }
 
     /// <summary>
-    /// Makes the exception for a directory that is not there.
+    /// Makes the entry of a directory.
     /// </summary>
-    protected DirectoryNotFoundException DirectoryNotFound(string path) => new($"No directory '{PathOf(path)}'");
+    protected FileEntry DirectoryEntryOf(string path,
+        DateTime? creationTimeUtc = null, DateTime? lastWriteTimeUtc = null)
+    {
+        var full = PathOf(path);
+        return new FileEntry(full, FileEntryKind.Directory, 0,
+            creationTimeUtc, lastWriteTimeUtc,
+            default, 0);
+    }
+
+    /// <inheritdoc/>
+    public bool Exists(string path)
+    {
+        ThrowIfDisposed();
+        return ExistsCore(FileSystemNames.NormalizePath(path));
+    }
+
+    /// <inheritdoc/>
+    public bool TryGetEntry(string path, out FileEntry entry)
+    {
+        ThrowIfDisposed();
+        return TryGetEntryCore(FileSystemNames.NormalizePath(path), out entry);
+    }
+
+    /// <inheritdoc/>
+    public IEnumerable<FileEntry> Enumerate(string directory, string pattern = "*", bool recursive = false)
+    {
+        ThrowIfDisposed();
+        Require(DomainCapabilities.Enumerate, "list files");
+        ArgumentNullException.ThrowIfNull(pattern);
+        return EnumerateCore(FileSystemNames.NormalizePath(directory, nameof(directory)), pattern, recursive);
+    }
+
+    /// <inheritdoc/>
+    public Stream Open(string path, FileOpenOptions options)
+    {
+        ThrowIfDisposed();
+        RequireFor(options);
+        return OpenCore(FileSystemNames.NormalizePath(path), options);
+    }
+
+    /// <inheritdoc/>
+    public ValueTask<Stream> OpenAsync(string path, FileOpenOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ThrowIfDisposed();
+        RequireFor(options);
+        return OpenAsyncCore(FileSystemNames.NormalizePath(path), options, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public IRandomAccessFile OpenRandomAccess(string path)
+    {
+        ThrowIfDisposed();
+        Require(DomainCapabilities.RandomAccess, "read at offsets");
+        return OpenRandomAccessCore(FileSystemNames.NormalizePath(path));
+    }
+
+    /// <inheritdoc/>
+    public bool TryGetMemory(string path, out ReadOnlyMemory<byte> data)
+    {
+        ThrowIfDisposed();
+        data = default;
+        return (Capabilities & DomainCapabilities.Memory) != 0
+               && TryGetMemoryCore(FileSystemNames.NormalizePath(path), out data);
+    }
+
+    /// <inheritdoc/>
+    public void CreateDirectory(string path)
+    {
+        ThrowIfDisposed();
+        Require(DomainCapabilities.Write, "create directories");
+        CreateDirectoryCore(FileSystemNames.NormalizePath(path));
+    }
+
+    /// <inheritdoc/>
+    public bool Delete(string path, bool recursive = false)
+    {
+        ThrowIfDisposed();
+        Require(DomainCapabilities.Write, "delete");
+        var normalized = FileSystemNames.NormalizePath(path);
+        if (normalized.Length == 0) throw new IOException($"The root of the domain '{Name}' cannot be deleted");
+        return DeleteCore(normalized, recursive);
+    }
+
+    /// <inheritdoc/>
+    public void Move(string source, string destination, bool overwrite = false)
+    {
+        ThrowIfDisposed();
+        Require(DomainCapabilities.Write, "move");
+        var from = FileSystemNames.NormalizePath(source, nameof(source));
+        var to = FileSystemNames.NormalizePath(destination, nameof(destination));
+        if (from.Length == 0 || to.Length == 0)
+            throw new IOException($"The root of the domain '{Name}' cannot be moved");
+        if (from == to) return;
+        if (to.StartsWith(from + "/", StringComparison.Ordinal))
+            throw new IOException($"'{PathOf(from)}' cannot move into itself");
+        MoveCore(from, to, overwrite);
+    }
+
+    /// <inheritdoc/>
+    public IDisposable Watch(string directory, bool recursive, Action<FileChange> handler)
+    {
+        ThrowIfDisposed();
+        Require(DomainCapabilities.Watch, "watch");
+        ArgumentNullException.ThrowIfNull(handler);
+        return WatchCore(FileSystemNames.NormalizePath(directory, nameof(directory)), recursive, handler);
+    }
 
     /// <inheritdoc/>
     public void Dispose()
@@ -272,24 +313,4 @@ public abstract class DomainBase
 
     /// <inheritdoc/>
     public override string ToString() => $"{Name}:// ({Scheme} {Source})";
-
-    private void Require(DomainCapabilities capability, string what)
-    {
-        if ((Capabilities & capability) != capability) throw Unsupported(what);
-    }
-
-    private void RequireFor(FileOpenOptions options)
-    {
-        if (options.Writes) Require(DomainCapabilities.Write, "write");
-        else Require(DomainCapabilities.Read, "read");
-
-        if ((options.Flags & FileOpenFlags.Atomic) == 0) return;
-
-        Require(DomainCapabilities.AtomicWrite, "replace files atomically");
-        if (options.Mode is not (FileMode.Create or FileMode.CreateNew) || options.Access != FileAccess.Write)
-            throw new ArgumentException("An atomic write creates the file anew: FileMode.Create or CreateNew, FileAccess.Write", nameof(options));
-    }
-
-    // Free for a path in its form already: the contract hands domains those, a direct caller may not
-    private static string Normalize(string path, string parameter = "path") => FileSystemNames.NormalizePath(path, parameter);
 }
