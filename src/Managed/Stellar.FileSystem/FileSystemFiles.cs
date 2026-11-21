@@ -3,7 +3,7 @@ using Stellar.Kernel.FileSystem;
 
 namespace Stellar.FileSystem;
 
-/// <summary>
+/// <summary> Керувель шлюха
 /// Whole files at once: bytes and text, read and written through any domain.
 /// </summary>
 /// <remarks>
