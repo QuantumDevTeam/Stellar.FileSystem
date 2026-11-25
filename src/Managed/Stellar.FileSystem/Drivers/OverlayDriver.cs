@@ -23,7 +23,10 @@ public sealed class OverlayDriver()
     public DomainScheme Scheme => DomainScheme.Overlay;
 
     /// <inheritdoc/>
-    public IDomain Mount(DomainMount mount, IFileSystem fileSystem) => new OverlayDomain(mount, fileSystem);
+    public IDomain Mount(DomainMount mount, IFileSystem fileSystem)
+    {
+        return new OverlayDomain(mount, fileSystem);
+    }
 }
 
 internal sealed class OverlayDomain
@@ -32,13 +35,15 @@ internal sealed class OverlayDomain
     private readonly string[] _layers;
     private readonly string? _writeLayer;
 
+    private readonly SemaphoreSlim _copying = new(1, 1);
+
     private static DomainCapabilities CapabilitiesOf(DomainMount mount)
     {
-        var capabilities = DomainCapabilities.Read
-                           | DomainCapabilities.Enumerate
-                           | DomainCapabilities.Watch
-                           | DomainCapabilities.RandomAccess
-                           | DomainCapabilities.Memory;
+        DomainCapabilities capabilities = DomainCapabilities.Read
+                                          | DomainCapabilities.Enumerate
+                                          | DomainCapabilities.Watch
+                                          | DomainCapabilities.RandomAccess
+                                          | DomainCapabilities.Memory;
         return mount.Options?.ContainsKey("write") == true
             ? capabilities | DomainCapabilities.Write | DomainCapabilities.AtomicWrite
             : capabilities;
@@ -59,7 +64,7 @@ internal sealed class OverlayDomain
         if (_layers.Contains(Name))
             throw new ArgumentException($"The overlay '{Name}' cannot be a layer of itself", nameof(mount));
 
-        if (!Options.TryGetValue("write", out var write)) return;
+        if (!Options.TryGetValue("write", out string? write)) return;
 
         _writeLayer = FileSystemNames.NormalizeName(write, nameof(mount));
         if (!_layers.Contains(_writeLayer))
@@ -69,52 +74,82 @@ internal sealed class OverlayDomain
 
     private IEnumerable<IDomain> Layers()
     {
-        foreach (var name in _layers)
-            if (FileSystem.Domains.TryGet(name, out var layer))
+        foreach (string name in _layers)
+            if (FileSystem.Domains.TryGet(name, out IDomain? layer))
                 yield return layer;
     }
 
-    private IDomain WriteLayer() =>
-        _writeLayer is not null && FileSystem.Domains.TryGet(_writeLayer, out var layer)
+    private IDomain WriteLayer()
+    {
+        return _writeLayer is not null && FileSystem.Domains.TryGet(_writeLayer, out IDomain? layer)
             ? layer
             : throw new InvalidOperationException(
                 $"The write layer '{_writeLayer}' of the overlay '{Name}' is not mounted");
+    }
 
     // The write layer gets its own copy of a file of a lower layer before changing it
     private void CopyUp(string path, IDomain layer, bool optional = false)
     {
-        var lower = Layers().FirstOrDefault(l => !ReferenceEquals(l, layer) && l.Exists(path));
+        IDomain? lower = Layers().FirstOrDefault(l => !ReferenceEquals(l, layer) && l.Exists(path));
         if (lower is null)
         {
             if (optional) return;
             throw NotFound(path);
         }
 
-        if (lower.TryGetEntry(path, out var entry) && entry.IsDirectory)
+        if (lower.TryGetEntry(path, out FileEntry entry) && entry.IsDirectory)
             throw Unsupported("change a directory of a lower layer");
 
-        using var source = lower.Open(path, FileOpenOptions.Read);
-        using var target = layer.Open(path, FileOpenOptions.Write);
+        bool atomic = (layer.Capabilities & DomainCapabilities.AtomicWrite) != 0;
+        using Stream source = lower.Open(path, FileOpenOptions.Read);
+        using Stream target = layer.Open(path, atomic ? FileOpenOptions.Replace : FileOpenOptions.Write);
         source.CopyTo(target);
     }
 
     private IDomain WriteLayerFor(string path, FileOpenOptions options)
     {
-        var layer = WriteLayer();
+        IDomain layer = WriteLayer();
         if (options.Mode is FileMode.Open or FileMode.OpenOrCreate or FileMode.Append && !layer.Exists(path))
-            CopyUp(path, layer, optional: true);
+            CopyUpOnce(path, layer, true);
         return layer;
     }
 
-    private IDomain ReadLayerOf(string path) =>
-        Layers().FirstOrDefault(layer => layer.Exists(path)) ?? throw NotFound(path);
+    private void CopyUpOnce(string path, IDomain layer, bool optional = false)
+    {
+        _copying.Wait();
+        try
+        {
+            if (!layer.Exists(path)) CopyUp(path, layer, optional);
+        }
+        finally
+        {
+            _copying.Release();
+        }
+    }
+
+    private async ValueTask<Stream> OpenForWriteAsync(
+        string path, FileOpenOptions options,
+        CancellationToken cancellationToken
+    )
+    {
+        IDomain layer = WriteLayer();
+        if (options.Mode is FileMode.Open or FileMode.OpenOrCreate or FileMode.Append && !layer.Exists(path))
+            await Task.Run(() => CopyUpOnce(path, layer, true), cancellationToken).ConfigureAwait(false);
+
+        return await layer.OpenAsync(path, options, cancellationToken).ConfigureAwait(false);
+    }
+
+    private IDomain ReadLayerOf(string path)
+    {
+        return Layers().FirstOrDefault(layer => layer.Exists(path)) ?? throw NotFound(path);
+    }
 
     private sealed class Watches(List<IDisposable> watches)
         : IDisposable
     {
         public void Dispose()
         {
-            foreach (var watch in watches) watch.Dispose();
+            foreach (IDisposable watch in watches) watch.Dispose();
         }
     }
 
@@ -125,21 +160,33 @@ internal sealed class OverlayDomain
 
         public long Length => file.Length;
 
-        public int Read(long offset, Span<byte> buffer) => file.Read(offset, buffer);
+        public int Read(long offset, Span<byte> buffer)
+        {
+            return file.Read(offset, buffer);
+        }
 
-        public ValueTask<int> ReadAsync(long offset, Memory<byte> buffer,
-            CancellationToken cancellationToken = default) =>
-            file.ReadAsync(offset, buffer, cancellationToken);
+        public ValueTask<int> ReadAsync(
+            long offset, Memory<byte> buffer,
+            CancellationToken cancellationToken = default
+        )
+        {
+            return file.ReadAsync(offset, buffer, cancellationToken);
+        }
 
-        public void Dispose() => file.Dispose();
+        public void Dispose()
+        {
+            file.Dispose();
+        }
     }
 
-    protected override bool ExistsCore(string path) =>
-        Layers().Any(layer => layer.Exists(path));
+    protected override bool ExistsCore(string path)
+    {
+        return Layers().Any(layer => layer.Exists(path));
+    }
 
     protected override bool TryGetEntryCore(string path, out FileEntry entry)
     {
-        foreach (var layer in Layers())
+        foreach (IDomain layer in Layers())
         {
             if (!layer.TryGetEntry(path, out entry)) continue;
             entry = entry with { Path = entry.Path.WithDomain(Name) };
@@ -152,8 +199,8 @@ internal sealed class OverlayDomain
 
     protected override IEnumerable<FileEntry> EnumerateCore(string directory, string pattern, bool recursive)
     {
-        var layers = Layers()
-            .Where(layer => layer.TryGetEntry(directory, out var entry) && entry.IsDirectory)
+        IDomain[] layers = Layers()
+            .Where(layer => layer.TryGetEntry(directory, out FileEntry entry) && entry.IsDirectory)
             .ToArray();
         if (layers.Length == 0)
             throw DirectoryNotFound(directory);
@@ -162,51 +209,67 @@ internal sealed class OverlayDomain
 
         IEnumerable<FileEntry> Merge()
         {
-            var seen = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var layer in layers)
-            foreach (var entry in layer.Enumerate(directory, pattern, recursive))
+            HashSet<string> seen = new(StringComparer.Ordinal);
+            foreach (IDomain layer in layers)
+            foreach (FileEntry entry in layer.Enumerate(directory, pattern, recursive))
                 if (seen.Add(entry.Path.Value))
                     yield return entry with { Path = entry.Path.WithDomain(Name) };
         }
     }
 
-    protected override Stream OpenCore(string path, FileOpenOptions options) =>
-        options.Writes ? WriteLayerFor(path, options).Open(path, options) : ReadLayerOf(path).Open(path, options);
+    protected override Stream OpenCore(string path, FileOpenOptions options)
+    {
+        return options.Writes
+            ? WriteLayerFor(path, options).Open(path, options)
+            : ReadLayerOf(path).Open(path, options);
+    }
 
-    protected override ValueTask<Stream> OpenAsyncCore(string path, FileOpenOptions options,
-        CancellationToken cancellationToken) =>
-        options.Writes
-            ? WriteLayerFor(path, options).OpenAsync(path, options, cancellationToken)
+    protected override ValueTask<Stream> OpenAsyncCore(
+        string path, FileOpenOptions options,
+        CancellationToken cancellationToken
+    )
+    {
+        return options.Writes
+            ? OpenForWriteAsync(path, options, cancellationToken)
             : ReadLayerOf(path).OpenAsync(path, options, cancellationToken);
+    }
 
-    protected override IRandomAccessFile OpenRandomAccessCore(string path) =>
-        new Renamed(PathOf(path), ReadLayerOf(path).OpenRandomAccess(path));
+    protected override IRandomAccessFile OpenRandomAccessCore(string path)
+    {
+        return new Renamed(PathOf(path), ReadLayerOf(path).OpenRandomAccess(path));
+    }
 
     protected override bool TryGetMemoryCore(string path, out ReadOnlyMemory<byte> data)
     {
         data = default;
-        var layer = Layers().FirstOrDefault(l => l.Exists(path));
+        IDomain? layer = Layers().FirstOrDefault(l => l.Exists(path));
         return layer is not null && layer.TryGetMemory(path, out data);
     }
 
-    protected override void CreateDirectoryCore(string path) => WriteLayer().CreateDirectory(path);
+    protected override void CreateDirectoryCore(string path)
+    {
+        WriteLayer().CreateDirectory(path);
+    }
 
-    protected override bool DeleteCore(string path, bool recursive) => WriteLayer().Delete(path, recursive);
+    protected override bool DeleteCore(string path, bool recursive)
+    {
+        return WriteLayer().Delete(path, recursive);
+    }
 
     protected override void MoveCore(string source, string destination, bool overwrite)
     {
-        var layer = WriteLayer();
-        if (!layer.Exists(source)) CopyUp(source, layer);
+        IDomain layer = WriteLayer();
+        if (!layer.Exists(source)) CopyUpOnce(source, layer);
         layer.Move(source, destination, overwrite);
     }
 
     protected override IDisposable WatchCore(string directory, bool recursive, Action<FileChange> handler)
     {
-        var watches = new List<IDisposable>();
-        foreach (var layer in Layers())
+        List<IDisposable> watches = new();
+        foreach (IDomain layer in Layers())
         {
             if ((layer.Capabilities & DomainCapabilities.Watch) == 0) continue;
-            if (!layer.TryGetEntry(directory, out var entry) || !entry.IsDirectory) continue;
+            if (!layer.TryGetEntry(directory, out FileEntry entry) || !entry.IsDirectory) continue;
 
             watches.Add(layer.Watch(directory, recursive, change => handler(change with
             {

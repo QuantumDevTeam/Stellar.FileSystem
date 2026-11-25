@@ -14,7 +14,10 @@ public sealed class MemoryDriver()
     public DomainScheme Scheme => DomainScheme.Memory;
 
     /// <inheritdoc/>
-    public IDomain Mount(DomainMount mount, IFileSystem fileSystem) => new MemoryDomain(mount, fileSystem);
+    public IDomain Mount(DomainMount mount, IFileSystem fileSystem)
+    {
+        return new MemoryDomain(mount, fileSystem);
+    }
 }
 
 /// <summary>
@@ -56,7 +59,7 @@ public sealed class MemoryDomain
         if (path.Length == 0 || _directories.Contains(path)) return false;
         if (_files.ContainsKey(path)) throw new IOException($"'{PathOf(path)}' is a file");
 
-        foreach (var ancestor in DomainPaths.AncestorsOf(path))
+        foreach (string ancestor in DomainPaths.AncestorsOf(path))
         {
             if (_files.ContainsKey(ancestor)) throw new IOException($"'{PathOf(ancestor)}' is a file");
             if (!_directories.Add(ancestor)) break;
@@ -69,13 +72,11 @@ public sealed class MemoryDomain
     private void Notify(FileChange change)
     {
         // Out of the lock: a handler may call the domain
-        foreach (var watcher in _watchers)
-        {
+        foreach (Watcher watcher in _watchers)
             if (DomainPaths.IsIn(change.Path.Value, watcher.Directory, watcher.Recursive)
                 || (!change.OldPath.IsEmpty &&
                     DomainPaths.IsIn(change.OldPath.Value, watcher.Directory, watcher.Recursive)))
                 watcher.Handler(change);
-        }
     }
 
     private void Commit(string path, byte[] data)
@@ -87,8 +88,8 @@ public sealed class MemoryDomain
             if (_directories.Contains(path))
                 throw new UnauthorizedAccessException($"'{PathOf(path)}' became a directory");
 
-            var now = DateTime.UtcNow;
-            var existed = _files.TryGetValue(path, out var old);
+            DateTime now = DateTime.UtcNow;
+            bool existed = _files.TryGetValue(path, out MemoryFile? old);
             AddDirectories(DomainPaths.ParentOf(path));
             _files[path] = new MemoryFile(data, old?.CreationTimeUtc ?? now, now, ++_revision);
             kind = existed ? FileChangeKind.Changed : FileChangeKind.Created;
@@ -102,7 +103,10 @@ public sealed class MemoryDomain
     {
         public void Dispose()
         {
-            lock (domain._sync) domain._watchers = domain._watchers.Where(w => !ReferenceEquals(w, watcher)).ToArray();
+            lock (domain._sync)
+            {
+                domain._watchers = domain._watchers.Where(w => !ReferenceEquals(w, watcher)).ToArray();
+            }
         }
     }
 
@@ -112,7 +116,8 @@ public sealed class MemoryDomain
     {
         private readonly MemoryDomain _domain;
         private readonly string _path;
-        private bool _committed;
+        private int _committed;
+        private volatile bool _failed;
 
         public CommitStream(MemoryDomain domain, string path, byte[] initial, bool append)
         {
@@ -122,13 +127,24 @@ public sealed class MemoryDomain
             Position = append ? Length : 0;
         }
 
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested) _failed = true;
+            return base.WriteAsync(buffer, offset, count, cancellationToken);
+        }
+
+        public override ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default
+        )
+        {
+            if (cancellationToken.IsCancellationRequested) _failed = true;
+            return base.WriteAsync(buffer, cancellationToken);
+        }
+
         protected override void Dispose(bool disposing)
         {
-            if (disposing && !_committed)
-            {
-                _committed = true;
-                _domain.Commit(_path, ToArray());
-            }
+            if (disposing && Interlocked.Exchange(ref _committed, 1) == 0 && !_failed) _domain.Commit(_path, ToArray());
 
             base.Dispose(disposing);
         }
@@ -137,7 +153,10 @@ public sealed class MemoryDomain
     /// <inheritdoc/>
     protected override bool ExistsCore(string path)
     {
-        lock (_sync) return _files.ContainsKey(path) || _directories.Contains(path);
+        lock (_sync)
+        {
+            return _files.ContainsKey(path) || _directories.Contains(path);
+        }
     }
 
     /// <inheritdoc/>
@@ -145,7 +164,7 @@ public sealed class MemoryDomain
     {
         lock (_sync)
         {
-            if (_files.TryGetValue(path, out var file))
+            if (_files.TryGetValue(path, out MemoryFile? file))
             {
                 entry = FileEntryOf(path, file.Data.Length, file.CreationTimeUtc, file.LastWriteTimeUtc, file.Revision);
                 return true;
@@ -159,17 +178,17 @@ public sealed class MemoryDomain
     /// <inheritdoc/>
     protected override IEnumerable<FileEntry> EnumerateCore(string directory, string pattern, bool recursive)
     {
-        var entries = new List<FileEntry>();
+        List<FileEntry> entries = new();
         lock (_sync)
         {
             if (!_directories.Contains(directory)) throw DirectoryNotFound(directory);
 
-            foreach (var path in _directories)
+            foreach (string path in _directories)
                 if (DomainPaths.IsIn(path, directory, recursive) &&
                     DomainPaths.Matches(pattern, DomainPaths.NameOf(path)))
                     entries.Add(DirectoryEntryOf(path));
 
-            foreach (var (path, file) in _files)
+            foreach ((string path, MemoryFile file) in _files)
                 if (DomainPaths.IsIn(path, directory, recursive) &&
                     DomainPaths.Matches(pattern, DomainPaths.NameOf(path)))
                     entries.Add(FileEntryOf(path, file.Data.Length, file.CreationTimeUtc, file.LastWriteTimeUtc,
@@ -200,9 +219,9 @@ public sealed class MemoryDomain
         }
 
         if (!options.Writes)
-            return new MemoryStream(file!.Data, 0, file.Data.Length, writable: false, publiclyVisible: true);
+            return new MemoryStream(file!.Data, 0, file.Data.Length, false, true);
 
-        var keep = file is not null && options.Mode is FileMode.Open or FileMode.OpenOrCreate or FileMode.Append;
+        bool keep = file is not null && options.Mode is FileMode.Open or FileMode.OpenOrCreate or FileMode.Append;
         return new CommitStream(this, path, keep ? file!.Data : [], options.Mode == FileMode.Append);
     }
 
@@ -211,23 +230,29 @@ public sealed class MemoryDomain
     {
         lock (_sync)
         {
-            var found = _files.TryGetValue(path, out var file);
+            bool found = _files.TryGetValue(path, out MemoryFile? file);
             data = found ? file!.Data : null;
             return found;
         }
     }
 
     /// <inheritdoc/>
-    protected override IRandomAccessFile OpenRandomAccessCore(string path) =>
-        TryGetMemoryCore(path, out var data)
+    protected override IRandomAccessFile OpenRandomAccessCore(string path)
+    {
+        return TryGetMemoryCore(path, out ReadOnlyMemory<byte> data)
             ? new MemoryRandomAccessFile(PathOf(path), data)
             : throw NotFound(path);
+    }
 
     /// <inheritdoc/>
     protected override void CreateDirectoryCore(string path)
     {
         bool created;
-        lock (_sync) created = AddDirectories(path);
+        lock (_sync)
+        {
+            created = AddDirectories(path);
+        }
+
         if (created) Notify(new FileChange(FileChangeKind.Created, PathOf(path)));
     }
 
@@ -240,13 +265,13 @@ public sealed class MemoryDomain
             {
                 if (!_directories.Contains(path)) return false;
 
-                var inside = _files.Keys.Where(file => DomainPaths.IsIn(file, path, true))
+                string[] inside = _files.Keys.Where(file => DomainPaths.IsIn(file, path, true))
                     .Concat(_directories.Where(directory => DomainPaths.IsIn(directory, path, true)))
                     .ToArray();
                 if (inside.Length > 0 && !recursive)
                     throw new IOException($"'{PathOf(path)}' is not empty");
 
-                foreach (var item in inside)
+                foreach (string item in inside)
                     if (!_files.Remove(item))
                         _directories.Remove(item);
                 _directories.Remove(path);
@@ -262,7 +287,7 @@ public sealed class MemoryDomain
     {
         lock (_sync)
         {
-            if (_files.TryGetValue(source, out var file))
+            if (_files.TryGetValue(source, out MemoryFile? file))
             {
                 if (_directories.Contains(destination))
                     throw new IOException($"'{PathOf(destination)}' is a directory");
@@ -279,22 +304,26 @@ public sealed class MemoryDomain
                     throw new IOException($"'{PathOf(destination)}' exists already");
 
                 AddDirectories(DomainPaths.ParentOf(destination));
-                var prefix = source + "/";
-                foreach (var directory in _directories
+                string prefix = source + "/";
+                foreach (string directory in _directories
                              .Where(d => d == source || d.StartsWith(prefix, StringComparison.Ordinal)).ToArray())
                 {
                     _directories.Remove(directory);
                     _directories.Add(destination + directory.Substring(source.Length));
                 }
 
-                foreach (var (path, moved) in _files.Where(f => f.Key.StartsWith(prefix, StringComparison.Ordinal))
+                foreach ((string path, MemoryFile moved) in _files
+                             .Where(f => f.Key.StartsWith(prefix, StringComparison.Ordinal))
                              .ToArray())
                 {
                     _files.Remove(path);
                     _files[destination + path.Substring(source.Length)] = moved with { Revision = ++_revision };
                 }
             }
-            else throw NotFound(source);
+            else
+            {
+                throw NotFound(source);
+            }
         }
 
         Notify(new FileChange(FileChangeKind.Renamed, PathOf(destination), PathOf(source)));

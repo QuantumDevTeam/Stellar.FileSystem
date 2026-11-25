@@ -55,7 +55,7 @@ public sealed class VirtualFileSystem
     private readonly DriverCatalog _drivers = new();
     private readonly DomainCatalog _domains = new();
     private readonly Lock _mounting = new();
-    private volatile bool _disposed;
+    private bool _disposed;
 
     /// <inheritdoc/>
     public IContentTypeCatalog ContentTypes { get; }
@@ -100,15 +100,15 @@ public sealed class VirtualFileSystem
     /// <inheritdoc/>
     public IDomain Mount(DomainMount mount)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        var name = FileSystemNames.NormalizeName(mount.Name, nameof(mount));
-        if (!_drivers.TryGet(mount.Scheme, out var driver))
+        string name = FileSystemNames.NormalizeName(mount.Name, nameof(mount));
+        if (!_drivers.TryGet(mount.Scheme, out IFileDriver? driver))
             throw new InvalidOperationException($"No driver of the scheme '{mount.Scheme}' is there, " +
                                                 $"for the domain '{name}'");
 
         IDomain domain;
         lock (_mounting)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (_domains.Contains(name))
                 throw new InvalidOperationException($"A domain '{name}' is mounted already");
 
@@ -156,9 +156,12 @@ public sealed class VirtualFileSystem
     /// </summary>
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        lock (_mounting)
+        {
+            if (_disposed) return;
+            _disposed = true;
+        }
 
-        foreach (var name in _domains.Keys) Unmount(name);
+        foreach (string name in _domains.Keys) Unmount(name);
     }
 }

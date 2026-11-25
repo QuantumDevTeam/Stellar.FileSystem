@@ -6,9 +6,7 @@ using Stellar.Kernel.Services;
 namespace Stellar.FileSystem;
 
 /// <summary>
-/// Publishes the file system of the engine:
-/// app:// is the folder of the application, read-only,
-/// user:// the folder of the user.
+/// Publishes the file system of the engine, with the domains of <see cref="Folders"/> mounted.
 /// </summary>
 [StellarEntryPoint]
 public sealed class FileSystemEntryPoint(RuntimeConfiguration configuration)
@@ -25,21 +23,7 @@ public sealed class FileSystemEntryPoint(RuntimeConfiguration configuration)
         _services = services;
         _fileSystem = VirtualFileSystem.CreateDefault();
 
-        _fileSystem.Mount(new DomainMount(
-            "app", DomainScheme.Directory, AppContext.BaseDirectory,
-            new Dictionary<string, string> { ["readonly"] = "true" }
-        ));
-
-        if (!string.IsNullOrWhiteSpace(RuntimeConfiguration.ProjectName))
-        {
-            string company = RuntimeConfiguration.CompanyName;
-            if (string.IsNullOrWhiteSpace(company) || company == "Unknown") company = "Starlet";
-            _fileSystem.Mount(new DomainMount(
-                "user", DomainScheme.Directory, Path.Combine(Environment.GetFolderPath(
-                        Environment.SpecialFolder.ApplicationData),
-                    company, RuntimeConfiguration.ProjectName)
-            ));
-        }
+        foreach (DomainMount mount in EngineMounts.Of(RuntimeConfiguration)) _fileSystem.Mount(mount);
 
         services.Set<IFileSystem>(_fileSystem);
 

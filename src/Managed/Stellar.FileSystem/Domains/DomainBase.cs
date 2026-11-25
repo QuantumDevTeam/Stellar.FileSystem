@@ -15,7 +15,7 @@ public abstract class DomainBase
     : Quant<MetaQuant>, IDomain
 {
     private static readonly IReadOnlyDictionary<string, string> NoOptions = new Dictionary<string, string>();
-    private volatile bool _disposed;
+    private int _disposed;
 
     /// <inheritdoc/>
     public string Name { get; }
@@ -42,7 +42,7 @@ public abstract class DomainBase
     /// <summary>
     /// Gets whether the domain is disposed.
     /// </summary>
-    protected bool IsDisposed => _disposed;
+    protected bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
     /// <summary>
     /// Makes the domain.
@@ -66,25 +66,34 @@ public abstract class DomainBase
     /// <summary>
     /// Makes the exception for what the domain cannot do.
     /// </summary>
-    protected NotSupportedException Unsupported(string what) =>
-        new($"The domain '{Name}' ({Scheme}) cannot {what}");
+    protected NotSupportedException Unsupported(string what)
+    {
+        return new NotSupportedException($"The domain '{Name}' ({Scheme}) cannot {what}");
+    }
 
     /// <summary>
     /// Makes the exception for a file that is not there.
     /// </summary>
-    protected FileNotFoundException NotFound(string path) =>
-        new($"No file '{PathOf(path)}'", PathOf(path).ToString());
+    protected FileNotFoundException NotFound(string path)
+    {
+        return new FileNotFoundException($"No file '{PathOf(path)}'", PathOf(path).ToString());
+    }
 
     /// <summary>
     /// Makes the exception for a directory that is not there.
     /// </summary>
-    protected DirectoryNotFoundException DirectoryNotFound(string path) =>
-        new($"No directory '{PathOf(path)}'");
+    protected DirectoryNotFoundException DirectoryNotFound(string path)
+    {
+        return new DirectoryNotFoundException($"No directory '{PathOf(path)}'");
+    }
 
     /// <summary>
     /// Throws if the domain is disposed.
     /// </summary>
-    protected void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
+    protected void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+    }
 
     private void Require(DomainCapabilities capability, string what)
     {
@@ -112,19 +121,28 @@ public abstract class DomainBase
     protected abstract bool TryGetEntryCore(string path, out FileEntry entry);
 
     /// <summary>The entries of a directory.</summary>
-    protected virtual IEnumerable<FileEntry> EnumerateCore(string directory, string pattern, bool recursive) =>
+    protected virtual IEnumerable<FileEntry> EnumerateCore(string directory, string pattern, bool recursive)
+    {
         throw Unsupported("list files");
+    }
 
     /// <summary>Opens a file; the options are checked against the capabilities.</summary>
     protected abstract Stream OpenCore(string path, FileOpenOptions options);
 
     /// <summary>Opens a file without blocking; by default, <see cref="OpenCore"/>.</summary>
-    protected virtual ValueTask<Stream> OpenAsyncCore(string path, FileOpenOptions options,
-        CancellationToken cancellationToken) =>
-        new(OpenCore(path, options));
+    protected virtual ValueTask<Stream> OpenAsyncCore(
+        string path, FileOpenOptions options,
+        CancellationToken cancellationToken
+    )
+    {
+        return new ValueTask<Stream>(OpenCore(path, options));
+    }
 
     /// <summary>Opens a file for reads at offsets.</summary>
-    protected virtual IRandomAccessFile OpenRandomAccessCore(string path) => throw Unsupported("read at offsets");
+    protected virtual IRandomAccessFile OpenRandomAccessCore(string path)
+    {
+        throw Unsupported("read at offsets");
+    }
 
     /// <summary>The bytes of a file in memory.</summary>
     protected virtual bool TryGetMemoryCore(string path, out ReadOnlyMemory<byte> data)
@@ -134,17 +152,28 @@ public abstract class DomainBase
     }
 
     /// <summary>Creates a directory.</summary>
-    protected virtual void CreateDirectoryCore(string path) => throw Unsupported("create directories");
+    protected virtual void CreateDirectoryCore(string path)
+    {
+        throw Unsupported("create directories");
+    }
 
     /// <summary>Deletes a file or a directory, never the root.</summary>
-    protected virtual bool DeleteCore(string path, bool recursive) => throw Unsupported("delete");
+    protected virtual bool DeleteCore(string path, bool recursive)
+    {
+        throw Unsupported("delete");
+    }
 
     /// <summary>Moves a file or a directory; neither is the root, and the destination is not inside the source.</summary>
-    protected virtual void MoveCore(string source, string destination, bool overwrite) => throw Unsupported("move");
+    protected virtual void MoveCore(string source, string destination, bool overwrite)
+    {
+        throw Unsupported("move");
+    }
 
     /// <summary>Watches a directory.</summary>
-    protected virtual IDisposable WatchCore(string directory, bool recursive, Action<FileChange> handler) =>
+    protected virtual IDisposable WatchCore(string directory, bool recursive, Action<FileChange> handler)
+    {
         throw Unsupported("watch");
+    }
 
     /// <summary>
     /// Releases what the domain holds: called once.
@@ -163,9 +192,9 @@ public abstract class DomainBase
     protected static bool GetFlag(IReadOnlyDictionary<string, string>? options, string key, bool fallback)
     {
         if (options is null
-            || !options.TryGetValue(key, out var text))
+            || !options.TryGetValue(key, out string? text))
             return fallback;
-        return bool.TryParse(text, out var value)
+        return bool.TryParse(text, out bool value)
             ? value
             : throw new ArgumentException($"The setting '{key}' is '{text}': expected true or false");
     }
@@ -175,16 +204,21 @@ public abstract class DomainBase
     /// </summary>
     /// <param name="path">The path inside the domain.</param>
     /// <returns>The full path.</returns>
-    protected FilePath PathOf(string path) => FilePath.Create(Name, path);
+    protected FilePath PathOf(string path)
+    {
+        return FilePath.Create(Name, path);
+    }
 
     /// <summary>
     /// Makes the entry of a file, its content type from the file system.
     /// </summary>
-    protected FileEntry FileEntryOf(string path, long length,
+    protected FileEntry FileEntryOf(
+        string path, long length,
         DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc,
-        long revision)
+        long revision
+    )
     {
-        var full = PathOf(path);
+        FilePath full = PathOf(path);
         return new FileEntry(full, FileEntryKind.File, length,
             creationTimeUtc, lastWriteTimeUtc,
             FileSystem.ContentTypes.Resolve(full), revision);
@@ -193,10 +227,12 @@ public abstract class DomainBase
     /// <summary>
     /// Makes the entry of a directory.
     /// </summary>
-    protected FileEntry DirectoryEntryOf(string path,
-        DateTime? creationTimeUtc = null, DateTime? lastWriteTimeUtc = null)
+    protected FileEntry DirectoryEntryOf(
+        string path,
+        DateTime? creationTimeUtc = null, DateTime? lastWriteTimeUtc = null
+    )
     {
-        var full = PathOf(path);
+        FilePath full = PathOf(path);
         return new FileEntry(full, FileEntryKind.Directory, 0,
             creationTimeUtc, lastWriteTimeUtc,
             default, 0);
@@ -234,8 +270,10 @@ public abstract class DomainBase
     }
 
     /// <inheritdoc/>
-    public ValueTask<Stream> OpenAsync(string path, FileOpenOptions options,
-        CancellationToken cancellationToken = default)
+    public ValueTask<Stream> OpenAsync(
+        string path, FileOpenOptions options,
+        CancellationToken cancellationToken = default
+    )
     {
         cancellationToken.ThrowIfCancellationRequested();
         ThrowIfDisposed();
@@ -273,7 +311,7 @@ public abstract class DomainBase
     {
         ThrowIfDisposed();
         Require(DomainCapabilities.Write, "delete");
-        var normalized = FileSystemNames.NormalizePath(path);
+        string normalized = FileSystemNames.NormalizePath(path);
         if (normalized.Length == 0) throw new IOException($"The root of the domain '{Name}' cannot be deleted");
         return DeleteCore(normalized, recursive);
     }
@@ -283,8 +321,8 @@ public abstract class DomainBase
     {
         ThrowIfDisposed();
         Require(DomainCapabilities.Write, "move");
-        var from = FileSystemNames.NormalizePath(source, nameof(source));
-        var to = FileSystemNames.NormalizePath(destination, nameof(destination));
+        string from = FileSystemNames.NormalizePath(source, nameof(source));
+        string to = FileSystemNames.NormalizePath(destination, nameof(destination));
         if (from.Length == 0 || to.Length == 0)
             throw new IOException($"The root of the domain '{Name}' cannot be moved");
         if (from == to) return;
@@ -305,12 +343,14 @@ public abstract class DomainBase
     /// <inheritdoc/>
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         DisposeCore();
         GC.SuppressFinalize(this);
     }
 
     /// <inheritdoc/>
-    public override string ToString() => $"{Name}:// ({Scheme} {Source})";
+    public override string ToString()
+    {
+        return $"{Name}:// ({Scheme} {Source})";
+    }
 }

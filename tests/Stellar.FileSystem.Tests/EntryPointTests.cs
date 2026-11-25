@@ -13,6 +13,11 @@ public sealed class EntryPointTests
     private static readonly string AppData =
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
 
+    private static readonly string[] Roots =
+    [
+        SystemFolders.AppData.Roaming, SystemFolders.AppData.Local, SystemFolders.AppData.LocalLow, SystemFolders.Temp
+    ];
+
     // Names nobody else has: what the tests leave in the real folder of the user is deleted whole
     private readonly string _company = "StellarTests-" + Guid.NewGuid().ToString("N");
     private readonly string _project = "Project-" + Guid.NewGuid().ToString("N");
@@ -20,14 +25,18 @@ public sealed class EntryPointTests
 
     public void Dispose()
     {
-        Delete(Path.Combine(AppData, _company));
-        Delete(Path.Combine(AppData, _project));
-        Delete(Path.Combine(AppData, "Starlet", _project));
-        Delete(Path.Combine(AppData, "Unknown", _project));
+        foreach (string root in Roots)
+        {
+            Delete(Path.Combine(root, _company));
+            Delete(Path.Combine(root, _project));
+            Delete(Path.Combine(root, "Starlet", _project));
+            Delete(Path.Combine(root, "Unknown", _project));
 
-        // Only if it is ours: a folder of somebody else is not empty
-        string shared = Path.Combine(AppData, "Starlet");
-        if (Directory.Exists(shared) && !Directory.EnumerateFileSystemEntries(shared).Any()) Directory.Delete(shared);
+            // Only if it is ours: a folder of somebody else is not empty
+            string shared = Path.Combine(root, "Starlet");
+            if (Directory.Exists(shared) && !Directory.EnumerateFileSystemEntries(shared).Any())
+                Directory.Delete(shared);
+        }
     }
 
     private static void Delete(string path)
@@ -66,7 +75,7 @@ public sealed class EntryPointTests
 
         var files = _services.Find<IFileSystem>()!;
         files.Should().BeOfType<VirtualFileSystem>();
-        files.Domains.Keys.Should().BeEquivalentTo("app", "user");
+        files.Domains.Keys.Should().BeEquivalentTo("app", "user", "local", "locallow", "temp");
 
         Stop(entryPoint);
         _services.Find<IFileSystem>().Should().BeNull();
@@ -94,6 +103,7 @@ public sealed class EntryPointTests
     {
         FileSystemEntryPoint entryPoint = Make(company!, _project);
         Run(entryPoint, _services);
+        _services.Find<IFileSystem>()!.WriteAllText(FilePath.Parse("user://a.txt"), "text");
         Stop(entryPoint);
 
         Directory.Exists(Path.Combine(AppData, "Starlet", _project)).Should().BeTrue();
@@ -170,7 +180,8 @@ public sealed class EntryPointTests
         Run(second, otherServices);
 
         Stop(first);
-        otherServices.Find<IFileSystem>()!.Domains.Keys.Should().BeEquivalentTo("app", "user");
+        otherServices.Find<IFileSystem>()!.Domains.Keys.Should()
+            .BeEquivalentTo("app", "user", "local", "locallow", "temp");
 
         Stop(second);
     }
