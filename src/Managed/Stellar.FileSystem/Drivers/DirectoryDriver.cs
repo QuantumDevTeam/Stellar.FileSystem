@@ -1,5 +1,7 @@
 using System.IO.Enumeration;
+
 using Microsoft.Win32.SafeHandles;
+
 using Stellar.Core.Quantization;
 using Stellar.FileSystem.Domains;
 using Stellar.Kernel.FileSystem;
@@ -14,11 +16,12 @@ namespace Stellar.FileSystem.Drivers;
 /// <para>Options:</para>
 /// <list type="bullet">
 /// <item><c>readonly=true</c>: no writes. A missing directory is then an error; otherwise it is created.</item>
+/// <item><c>lazy=true</c>: a missing directory is created by the first write, not by the mount.</item>
 /// <item><c>links=follow</c>: follows links wherever they lead. By default a link (symbolic link, junction) that
 /// leads out of the directory is refused, and listings do not go into linked directories.</item>
 /// </list>
 /// <para>Atomic writes go to a file beside the target, named <c>*.stellar-tmp</c>, which listings and watches
-/// never show.</para>
+/// never show. A write that failed or was cancelled leaves the file as it was.</para>
 /// </remarks>
 public sealed class DirectoryDriver()
     : Quant<MetaQuant>(new MetaQuant()), IFileDriver
@@ -27,7 +30,10 @@ public sealed class DirectoryDriver()
     public DomainScheme Scheme => DomainScheme.Directory;
 
     /// <inheritdoc/>
-    public IDomain Mount(DomainMount mount, IFileSystem fileSystem) => new DirectoryDomain(mount, fileSystem);
+    public IDomain Mount(DomainMount mount, IFileSystem fileSystem)
+    {
+        return new DirectoryDomain(mount, fileSystem);
+    }
 }
 
 /// <summary>
@@ -41,6 +47,7 @@ internal sealed class AtomicFileStream
     private readonly string _temporary;
     private readonly bool _overwrite;
     private int _committed;
+    private volatile bool _failed;
 
     public AtomicFileStream(string target, bool overwrite, FileOptions options)
         : this(target, TemporaryOf(target), overwrite, options)
@@ -57,15 +64,66 @@ internal sealed class AtomicFileStream
         _overwrite = overwrite;
     }
 
-    private static string TemporaryOf(string target) =>
-        Path.Combine(Path.GetDirectoryName(target)!,
+    private static string TemporaryOf(string target)
+    {
+        return Path.Combine(Path.GetDirectoryName(target)!,
             $".{Path.GetFileName(target)}.{Guid.NewGuid():N}{DirectoryDomain.TemporarySuffix}");
+    }
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        try
+        {
+            base.Write(buffer, offset, count);
+        }
+        catch
+        {
+            _failed = true;
+            throw;
+        }
+    }
+
+    public override void Write(ReadOnlySpan<byte> buffer)
+    {
+        try
+        {
+            base.Write(buffer);
+        }
+        catch
+        {
+            _failed = true;
+            throw;
+        }
+    }
+
+    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        return Remember(base.WriteAsync(buffer, offset, count, cancellationToken));
+    }
+
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        return new ValueTask(Remember(base.WriteAsync(buffer, cancellationToken).AsTask()));
+    }
+
+    private async Task Remember(Task write)
+    {
+        try
+        {
+            await write.ConfigureAwait(false);
+        }
+        catch
+        {
+            _failed = true;
+            throw;
+        }
+    }
 
     protected override void Dispose(bool disposing)
     {
         // The bytes reach the disk before the file takes their place
-        var commit = disposing && Volatile.Read(ref _committed) == 0 && CanWrite;
-        if (commit) Flush(flushToDisk: true);
+        bool commit = disposing && Volatile.Read(ref _committed) == 0 && CanWrite;
+        if (commit) Flush(true);
         base.Dispose(disposing);
         if (commit) Commit();
     }
@@ -79,7 +137,7 @@ internal sealed class AtomicFileStream
         }
 
         await FlushAsync().ConfigureAwait(false);
-        Flush(flushToDisk: true);
+        Flush(true);
         await base.DisposeAsync().ConfigureAwait(false);
         Commit();
     }
@@ -87,6 +145,12 @@ internal sealed class AtomicFileStream
     private void Commit()
     {
         if (Interlocked.Exchange(ref _committed, 1) != 0) return;
+
+        if (_failed)
+        {
+            File.Delete(_temporary);
+            return;
+        }
 
         try
         {
@@ -116,11 +180,13 @@ internal sealed class DirectoryDomain
     // With a separator at the end, so "C:\Game2" is not inside "C:\Game"
     private readonly string _root;
     private readonly bool _followLinks;
+    private readonly bool _lazy;
 
     private static DomainCapabilities CapabilitiesOf(DomainMount mount)
     {
-        var capabilities = DomainCapabilities.Read | DomainCapabilities.Enumerate | DomainCapabilities.Watch |
-                           DomainCapabilities.RandomAccess;
+        DomainCapabilities capabilities = DomainCapabilities.Read | DomainCapabilities.Enumerate |
+                                          DomainCapabilities.Watch |
+                                          DomainCapabilities.RandomAccess;
         return GetFlag(mount.Options, "readonly", false)
             ? capabilities
             : capabilities | DomainCapabilities.Write | DomainCapabilities.AtomicWrite;
@@ -134,15 +200,17 @@ internal sealed class DirectoryDomain
             throw new ArgumentException($"The source of the dir domain '{mount.Name}' must be a full path, " +
                                         $"resolved by the runtime: '{mount.Source}'", nameof(mount));
 
-        var full = Path.GetFullPath(mount.Source).TrimEnd(Separator, Path.AltDirectorySeparatorChar);
+        string full = Path.GetFullPath(mount.Source).TrimEnd(Separator, Path.AltDirectorySeparatorChar);
         _root = full + Separator;
-        _followLinks = Options.TryGetValue("links", out var links) && links == "follow";
+        _followLinks = Options.TryGetValue("links", out string? links) && links == "follow";
+
+        _lazy = GetFlag(Options, "lazy", false);
 
         if (!Directory.Exists(full))
         {
             if ((Capabilities & DomainCapabilities.Write) == 0)
                 throw new DirectoryNotFoundException($"No directory '{full}' for the domain '{Name}'");
-            Directory.CreateDirectory(full);
+            if (!_lazy) Directory.CreateDirectory(full);
         }
     }
 
@@ -151,16 +219,16 @@ internal sealed class DirectoryDomain
     {
         if (path.Length == 0) return _root;
 
-        var full = _root + (Separator == '/' ? path : path.Replace('/', Separator));
+        string full = _root + (Separator == '/' ? path : path.Replace('/', Separator));
         if (_followLinks) return full;
 
-        for (var index = _root.Length;; index++)
+        for (int index = _root.Length;; index++)
         {
             index = full.IndexOf(Separator, index);
-            var current = index < 0 ? full : full.Substring(0, index);
+            string current = index < 0 ? full : full.Substring(0, index);
 
             var info = new FileInfo(current);
-            var attributes = (int)info.Attributes;
+            int attributes = (int)info.Attributes;
             if (attributes == -1) break; // Nothing there, nor below
             if ((info.Attributes & FileAttributes.ReparsePoint) != 0 && info.LinkTarget is not null
                                                                      && !IsInside(
@@ -177,7 +245,7 @@ internal sealed class DirectoryDomain
     private FileEntry EntryOf(string path, FileInfo file)
     {
         // The time of the last write, and the length for file systems that keep the time coarse
-        var revision = unchecked((file.LastWriteTimeUtc.Ticks * 397) ^ file.Length);
+        long revision = unchecked((file.LastWriteTimeUtc.Ticks * 397) ^ file.Length);
         return FileEntryOf(path, file.Length, file.CreationTimeUtc, file.LastWriteTimeUtc, revision);
     }
 
@@ -187,25 +255,27 @@ internal sealed class DirectoryDomain
         if (!(full + Separator).StartsWith(_root, PathComparison) || full.Length < _root.Length) return null;
         if (full.EndsWith(TemporarySuffix, StringComparison.Ordinal)) return null;
 
-        var relative = full.Substring(_root.Length);
+        string relative = full.Substring(_root.Length);
         if (Separator != '/') relative = relative.Replace(Separator, '/');
         if (Separator == '/' && relative.Contains('\\')) return null;
 
         // A name the engine would not accept (possible on some file systems) is not a file of the domain
-        return FileSystemNames.TryNormalizePath(relative, out var normalized) && normalized == relative
+        return FileSystemNames.TryNormalizePath(relative, out string normalized) && normalized == relative
             ? relative
             : null;
     }
 
-    private bool IsInside(string? full) =>
-        full is not null && (full + Separator).StartsWith(_root, PathComparison);
+    private bool IsInside(string? full)
+    {
+        return full is not null && (full + Separator).StartsWith(_root, PathComparison);
+    }
 
     private Stream OpenFile(string path, FileOpenOptions options, bool asynchronous)
     {
-        var full = Resolve(path);
+        string full = Resolve(path);
         if (Directory.Exists(full)) throw new UnauthorizedAccessException($"'{PathOf(path)}' is a directory");
 
-        var fileOptions = asynchronous ? FileOptions.Asynchronous : FileOptions.None;
+        FileOptions fileOptions = asynchronous ? FileOptions.Asynchronous : FileOptions.None;
         if ((options.Flags & FileOpenFlags.Sequential) != 0) fileOptions |= FileOptions.SequentialScan;
         if ((options.Flags & FileOpenFlags.RandomAccess) != 0) fileOptions |= FileOptions.RandomAccess;
 
@@ -241,20 +311,30 @@ internal sealed class DirectoryDomain
 
         public long Length => RandomAccess.GetLength(handle);
 
-        public int Read(long offset, Span<byte> buffer) => RandomAccess.Read(handle, buffer, offset);
+        public int Read(long offset, Span<byte> buffer)
+        {
+            return RandomAccess.Read(handle, buffer, offset);
+        }
 
-        public ValueTask<int> ReadAsync(long offset, Memory<byte> buffer,
-            CancellationToken cancellationToken = default) =>
-            RandomAccess.ReadAsync(handle, buffer, offset, cancellationToken);
+        public ValueTask<int> ReadAsync(
+            long offset, Memory<byte> buffer,
+            CancellationToken cancellationToken = default
+        )
+        {
+            return RandomAccess.ReadAsync(handle, buffer, offset, cancellationToken);
+        }
 
-        public void Dispose() => handle.Dispose();
+        public void Dispose()
+        {
+            handle.Dispose();
+        }
     }
 
     protected override bool ExistsCore(string path)
     {
         try
         {
-            var full = Resolve(path);
+            string full = Resolve(path);
             return File.Exists(full) || Directory.Exists(full);
         }
         catch (UnauthorizedAccessException)
@@ -292,8 +372,9 @@ internal sealed class DirectoryDomain
 
     protected override IEnumerable<FileEntry> EnumerateCore(string directory, string pattern, bool recursive)
     {
-        var full = Resolve(directory);
-        if (!Directory.Exists(full)) throw DirectoryNotFound(directory);
+        string full = Resolve(directory);
+        if (!Directory.Exists(full))
+            return _lazy && directory.Length == 0 ? [] : throw DirectoryNotFound(directory);
 
         var options = new EnumerationOptions
         {
@@ -303,7 +384,7 @@ internal sealed class DirectoryDomain
             ReturnSpecialDirectories = false
         };
 
-        var entries = new FileSystemEnumerable<FileSystemInfo>(full,
+        FileSystemEnumerable<FileSystemInfo> entries = new(full,
             (ref FileSystemEntry entry) => entry.ToFileSystemInfo(), options)
         {
             ShouldIncludePredicate = (ref FileSystemEntry entry) =>
@@ -318,7 +399,7 @@ internal sealed class DirectoryDomain
 
         IEnumerable<FileEntry> Select(IEnumerable<FileSystemInfo> infos)
         {
-            foreach (var info in infos)
+            foreach (FileSystemInfo info in infos)
             {
                 if (RelativeOf(info.FullName) is not { } path) continue;
                 if (!_followLinks && info.LinkTarget is not null &&
@@ -331,29 +412,38 @@ internal sealed class DirectoryDomain
         }
     }
 
-    protected override Stream OpenCore(string path, FileOpenOptions options) =>
-        OpenFile(path, options, asynchronous: false);
+    protected override Stream OpenCore(string path, FileOpenOptions options)
+    {
+        return OpenFile(path, options, false);
+    }
 
-    protected override ValueTask<Stream> OpenAsyncCore(string path, FileOpenOptions options,
-        CancellationToken cancellationToken) =>
-        new(OpenFile(path, options, asynchronous: true));
+    protected override ValueTask<Stream> OpenAsyncCore(
+        string path, FileOpenOptions options,
+        CancellationToken cancellationToken
+    )
+    {
+        return new ValueTask<Stream>(OpenFile(path, options, true));
+    }
 
     protected override IRandomAccessFile OpenRandomAccessCore(string path)
     {
-        var full = Resolve(path);
+        string full = Resolve(path);
         if (!File.Exists(full)) throw NotFound(path);
 
-        var handle = File.OpenHandle(full, FileMode.Open, FileAccess.Read,
+        SafeFileHandle handle = File.OpenHandle(full, FileMode.Open, FileAccess.Read,
             FileShare.ReadWrite | FileShare.Delete,
             FileOptions.RandomAccess | FileOptions.Asynchronous);
         return new RandomAccessFile(PathOf(path), handle);
     }
 
-    protected override void CreateDirectoryCore(string path) => Directory.CreateDirectory(Resolve(path));
+    protected override void CreateDirectoryCore(string path)
+    {
+        Directory.CreateDirectory(Resolve(path));
+    }
 
     protected override bool DeleteCore(string path, bool recursive)
     {
-        var full = Resolve(path);
+        string full = Resolve(path);
         if (File.Exists(full))
         {
             File.Delete(full);
@@ -369,8 +459,8 @@ internal sealed class DirectoryDomain
 
     protected override void MoveCore(string source, string destination, bool overwrite)
     {
-        var from = Resolve(source);
-        var to = Resolve(destination);
+        string from = Resolve(source);
+        string to = Resolve(destination);
         Directory.CreateDirectory(Path.GetDirectoryName(to)!);
 
         if (File.Exists(from)) File.Move(from, to, overwrite);
@@ -380,7 +470,8 @@ internal sealed class DirectoryDomain
 
     protected override IDisposable WatchCore(string directory, bool recursive, Action<FileChange> handler)
     {
-        var full = Resolve(directory);
+        string full = Resolve(directory);
+        if (_lazy && directory.Length == 0) Directory.CreateDirectory(full);
         if (!Directory.Exists(full)) throw DirectoryNotFound(directory);
 
         var watcher = new FileSystemWatcher(full)
@@ -400,7 +491,7 @@ internal sealed class DirectoryDomain
         };
         watcher.Renamed += (_, e) =>
         {
-            var path = RelativeOf(e.FullPath);
+            string? path = RelativeOf(e.FullPath);
             if (path is null) return;
 
             // The end of an atomic write: the file got new content
@@ -410,7 +501,7 @@ internal sealed class DirectoryDomain
                 return;
             }
 
-            var old = RelativeOf(e.OldFullPath);
+            string? old = RelativeOf(e.OldFullPath);
             handler(old is null
                 ? new FileChange(FileChangeKind.Created, PathOf(path))
                 : new FileChange(FileChangeKind.Renamed, PathOf(path), PathOf(old)));

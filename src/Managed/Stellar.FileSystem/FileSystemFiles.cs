@@ -1,4 +1,5 @@
 using System.Text;
+
 using Stellar.Kernel.FileSystem;
 
 namespace Stellar.FileSystem;
@@ -15,7 +16,7 @@ public static class FileSystemFiles
 {
     private static byte[] ReadToEnd(Stream stream)
     {
-        if (stream is MemoryStream memory && memory.TryGetBuffer(out var segment))
+        if (stream is MemoryStream memory && memory.TryGetBuffer(out ArraySegment<byte> segment))
             return segment.AsSpan((int)memory.Position).ToArray();
 
         var buffer = new MemoryStream(stream.CanSeek ? (int)Math.Min(stream.Length, int.MaxValue) : 0);
@@ -25,8 +26,8 @@ public static class FileSystemFiles
 
     private static Encoding EncodingOf(IFileSystem fileSystem, FilePath path)
     {
-        var charset = fileSystem.ContentTypes.Resolve(path).Charset;
-        if (charset is null or "utf-8" or "utf8") return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+        string? charset = fileSystem.ContentTypes.Resolve(path).Charset;
+        if (charset is null or "utf-8" or "utf8") return new UTF8Encoding(false);
 
         try
         {
@@ -34,7 +35,7 @@ public static class FileSystemFiles
         }
         catch (ArgumentException)
         {
-            return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+            return new UTF8Encoding(false);
         }
     }
 
@@ -55,10 +56,10 @@ public static class FileSystemFiles
     /// <returns>A copy of its bytes.</returns>
     public static byte[] ReadAllBytes(this IFileSystem fileSystem, FilePath path)
     {
-        var domain = fileSystem.GetDomain(path);
-        if (domain.TryGetMemory(path.Value, out var memory)) return memory.ToArray();
+        IDomain domain = fileSystem.GetDomain(path);
+        if (domain.TryGetMemory(path.Value, out ReadOnlyMemory<byte> memory)) return memory.ToArray();
 
-        using var stream = domain.Open(path.Value,
+        using Stream stream = domain.Open(path.Value,
             FileOpenOptions.Read with { Flags = FileOpenFlags.Sequential });
         return ReadToEnd(stream);
     }
@@ -70,13 +71,15 @@ public static class FileSystemFiles
     /// <param name="path">The file.</param>
     /// <param name="cancellationToken">Stops the read.</param>
     /// <returns>A copy of its bytes.</returns>
-    public static async ValueTask<byte[]> ReadAllBytesAsync(this IFileSystem fileSystem, FilePath path,
-        CancellationToken cancellationToken = default)
+    public static async ValueTask<byte[]> ReadAllBytesAsync(
+        this IFileSystem fileSystem, FilePath path,
+        CancellationToken cancellationToken = default
+    )
     {
-        var domain = fileSystem.GetDomain(path);
-        if (domain.TryGetMemory(path.Value, out var memory)) return memory.ToArray();
+        IDomain domain = fileSystem.GetDomain(path);
+        if (domain.TryGetMemory(path.Value, out ReadOnlyMemory<byte> memory)) return memory.ToArray();
 
-        await using var stream = await domain.OpenAsync(path.Value,
+        await using Stream stream = await domain.OpenAsync(path.Value,
                 FileOpenOptions.Read with { Flags = FileOpenFlags.Sequential }, cancellationToken)
             .ConfigureAwait(false);
         var buffer = new MemoryStream(stream.CanSeek ? (int)Math.Min(stream.Length, int.MaxValue) : 0);
@@ -92,14 +95,68 @@ public static class FileSystemFiles
     /// <returns>Its text.</returns>
     public static string ReadAllText(this IFileSystem fileSystem, FilePath path)
     {
-        var encoding = EncodingOf(fileSystem, path);
-        var domain = fileSystem.GetDomain(path);
-        if (domain.TryGetMemory(path.Value, out var memory)) return Decode(memory.Span, encoding);
+        Encoding encoding = EncodingOf(fileSystem, path);
+        IDomain domain = fileSystem.GetDomain(path);
+        if (domain.TryGetMemory(path.Value, out ReadOnlyMemory<byte> memory)) return Decode(memory.Span, encoding);
 
-        using var stream = domain.Open(path.Value,
+        using Stream stream = domain.Open(path.Value,
             FileOpenOptions.Read with { Flags = FileOpenFlags.Sequential });
-        using var reader = new StreamReader(stream, encoding, detectEncodingFromByteOrderMarks: true);
+        using var reader = new StreamReader(stream, encoding, true);
         return reader.ReadToEnd();
+    }
+
+    /// <summary>
+    /// Reads a file as text without blocking on a slow source.
+    /// </summary>
+    /// <param name="fileSystem">The file system.</param>
+    /// <param name="path">The file.</param>
+    /// <param name="cancellationToken">Stops the read.</param>
+    /// <returns>Its text.</returns>
+    public static async ValueTask<string> ReadAllTextAsync(
+        this IFileSystem fileSystem, FilePath path,
+        CancellationToken cancellationToken = default
+    )
+    {
+        byte[] data = await fileSystem.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
+        return Decode(data, EncodingOf(fileSystem, path));
+    }
+
+    /// <summary>
+    /// Writes the bytes of a file, replacing it, without blocking on a slow source.
+    /// </summary>
+    /// <param name="fileSystem">The file system.</param>
+    /// <param name="path">The file.</param>
+    /// <param name="data">The bytes; they must not change until the write ends.</param>
+    /// <param name="atomic">Whether the file is the old one or the new one, never a part of it, a cancelled write included; needs <see cref="DomainCapabilities.AtomicWrite"/>.</param>
+    /// <param name="cancellationToken">Stops the write.</param>
+    /// <returns>Ends when the file is written.</returns>
+    public static async ValueTask WriteAllBytesAsync(
+        this IFileSystem fileSystem, FilePath path,
+        ReadOnlyMemory<byte> data, bool atomic = false, CancellationToken cancellationToken = default
+    )
+    {
+        FileOpenOptions options = atomic ? FileOpenOptions.Replace : FileOpenOptions.Write;
+        await using Stream stream = await fileSystem.OpenAsync(path, options, cancellationToken).ConfigureAwait(false);
+        await stream.WriteAsync(data, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Writes a file as text, replacing it, without blocking on a slow source; the charset as in <see cref="WriteAllText"/>.
+    /// </summary>
+    /// <param name="fileSystem">The file system.</param>
+    /// <param name="path">The file.</param>
+    /// <param name="text">The text.</param>
+    /// <param name="atomic">Whether the file is the old one or the new one, never a part of it, a cancelled write included; needs <see cref="DomainCapabilities.AtomicWrite"/>.</param>
+    /// <param name="cancellationToken">Stops the write.</param>
+    /// <returns>Ends when the file is written.</returns>
+    public static ValueTask WriteAllTextAsync(
+        this IFileSystem fileSystem, FilePath path,
+        string text, bool atomic = false, CancellationToken cancellationToken = default
+    )
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        return fileSystem.WriteAllBytesAsync(path, EncodingOf(fileSystem, path).GetBytes(text), atomic,
+            cancellationToken);
     }
 
     /// <summary>
@@ -109,10 +166,12 @@ public static class FileSystemFiles
     /// <param name="path">The file.</param>
     /// <param name="data">The bytes.</param>
     /// <param name="atomic">Whether the file is the old one or the new one, never a part of it; needs <see cref="DomainCapabilities.AtomicWrite"/>.</param>
-    public static void WriteAllBytes(this IFileSystem fileSystem, FilePath path,
-        ReadOnlySpan<byte> data, bool atomic = false)
+    public static void WriteAllBytes(
+        this IFileSystem fileSystem, FilePath path,
+        ReadOnlySpan<byte> data, bool atomic = false
+    )
     {
-        using var stream = fileSystem.Open(path, atomic ? FileOpenOptions.Replace : FileOpenOptions.Write);
+        using Stream stream = fileSystem.Open(path, atomic ? FileOpenOptions.Replace : FileOpenOptions.Write);
         stream.Write(data);
     }
 
@@ -123,8 +182,10 @@ public static class FileSystemFiles
     /// <param name="path">The file.</param>
     /// <param name="text">The text.</param>
     /// <param name="atomic">Whether the file is the old one or the new one, never a part of it; needs <see cref="DomainCapabilities.AtomicWrite"/>.</param>
-    public static void WriteAllText(this IFileSystem fileSystem, FilePath path,
-        string text, bool atomic = false)
+    public static void WriteAllText(
+        this IFileSystem fileSystem, FilePath path,
+        string text, bool atomic = false
+    )
     {
         ArgumentNullException.ThrowIfNull(text);
         fileSystem.WriteAllBytes(path, EncodingOf(fileSystem, path).GetBytes(text), atomic);
